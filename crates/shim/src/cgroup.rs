@@ -28,7 +28,7 @@ use cgroups_rs::{
     CgroupPid, MaxValue, Subsystem,
 };
 use containerd_shim_protos::{
-    cgroups::metrics::{CPUStat, CPUUsage, MemoryEntry, MemoryStat, Metrics, PidsStat, Throttle},
+    cgroups::metrics::{BlkIOEntry, BlkIOStat, CPUStat, CPUUsage, MemoryEntry, MemoryStat, Metrics, PidsStat, Throttle},
     protobuf::{well_known_types::any::Any, Message},
     shim::oci::Options,
 };
@@ -118,47 +118,137 @@ pub fn collect_metrics(pid: u32) -> Result<Metrics> {
                 let mut cpu_usage = CPUUsage::new();
                 let mut throttle = Throttle::new();
                 let stat = cpu_ctr.cpu().stat;
-                for line in stat.lines() {
-                    let parts = line.split(' ').collect::<Vec<&str>>();
-                    if parts.len() != 2 {
-                        Err(Error::Other(format!("invalid cpu stat line: {}", line)))?;
-                    }
-
-                    // https://github.com/opencontainers/runc/blob/dbe8434359ca35af1c1e10df42b1f4391c1e1010/libcontainer/cgroups/fs2/cpu.go#L70
-                    match parts[0] {
-                        "usage_usec" => {
-                            cpu_usage.set_total(parts[1].parse::<u64>().unwrap());
-                        }
-                        "user_usec" => {
-                            cpu_usage.set_user(parts[1].parse::<u64>().unwrap());
-                        }
-                        "system_usec" => {
-                            cpu_usage.set_kernel(parts[1].parse::<u64>().unwrap());
-                        }
-                        "nr_periods" => {
-                            throttle.set_periods(parts[1].parse::<u64>().unwrap());
-                        }
-                        "nr_throttled" => {
-                            throttle.set_throttled_periods(parts[1].parse::<u64>().unwrap());
-                        }
-                        "throttled_usec" => {
-                            throttle.set_throttled_time(parts[1].parse::<u64>().unwrap());
-                        }
-                        _ => {}
-                    }
-                }
+                
+                // Use helper function for cleaner parsing
+                set_cpu_usage_and_throttle(&stat, &mut cpu_usage, &mut throttle);
+                
                 let mut cpu_stats = CPUStat::new();
                 cpu_stats.set_throttling(throttle);
                 cpu_stats.set_usage(cpu_usage);
                 metrics.set_cpu(cpu_stats);
             }
+            Subsystem::CpuAcct(cpuacct_ctr) => {
+                // Add CpuAcct metrics support
+                let acct = cpuacct_ctr.cpuacct();
+                let mut cpu_usage = CPUUsage::new();
+                cpu_usage.set_total(acct.usage);
+                cpu_usage.set_kernel(acct.usage_sys);
+                cpu_usage.set_user(acct.usage_user);
+                cpu_usage.set_per_cpu(
+                    acct.usage_percpu
+                        .split_whitespace()
+                        .map(|s| s.parse::<u64>().unwrap_or_default())
+                        .collect(),
+                );
+                
+                // Merge with existing CPU stats or create new
+                let mut cpu_stat = if let Some(existing) = metrics.cpu.as_ref() {
+                    existing.clone()
+                } else {
+                    CPUStat::new()
+                };
+                cpu_stat.set_usage(cpu_usage);
+                metrics.set_cpu(cpu_stat);
+            }
+            Subsystem::BlkIo(blkio_ctr) => {
+                // Add BlkIO metrics support
+                let mut blkio_stat = BlkIOStat::new();
+                let mut io_service_bytes_recursive: Vec<BlkIOEntry> = Vec::new();
+                let blkio = blkio_ctr.blkio().io_service_bytes_recursive;
+                
+                for data in blkio.iter() {
+                    if data.read != 0 {
+                        let mut entry = BlkIOEntry::new();
+                        entry.set_major(data.major as u64);
+                        entry.set_minor(data.minor as u64);
+                        entry.set_op("read".to_string());
+                        entry.set_value(data.read);
+                        io_service_bytes_recursive.push(entry);
+                    }
+                    if data.write != 0 {
+                        let mut entry = BlkIOEntry::new();
+                        entry.set_major(data.major as u64);
+                        entry.set_minor(data.minor as u64);
+                        entry.set_op("write".to_string());
+                        entry.set_value(data.write);
+                        io_service_bytes_recursive.push(entry);
+                    }
+                }
+                blkio_stat.set_io_service_bytes_recursive(io_service_bytes_recursive);
+                metrics.set_blkio(blkio_stat);
+            }
             Subsystem::Mem(mem_ctr) => {
+                let mut mem_stat = MemoryStat::new();
+
+                // set memory
                 let mem = mem_ctr.memory_stat();
                 let mut mem_entry = MemoryEntry::new();
                 mem_entry.set_usage(mem.usage_in_bytes);
-                let mut mem_stat = MemoryStat::new();
+                mem_entry.set_limit(mem.limit_in_bytes as u64);
+                mem_entry.set_max(mem.max_usage_in_bytes);
+                mem_entry.set_failcnt(mem.fail_cnt);
                 mem_stat.set_usage(mem_entry);
+
+                // set swap memory
+                let memswap = mem_ctr.memswap();
+                let mut memswap_entry = MemoryEntry::new();
+                memswap_entry.set_usage(memswap.usage_in_bytes);
+                memswap_entry.set_limit(memswap.limit_in_bytes as u64);
+                memswap_entry.set_max(memswap.max_usage_in_bytes);
+                memswap_entry.set_failcnt(memswap.fail_cnt);
+                mem_stat.set_swap(memswap_entry);
+
+                // set kernel memory
+                let kmem = mem_ctr.kmem_stat();
+                let mut kmem_entry = MemoryEntry::new();
+                kmem_entry.set_usage(kmem.usage_in_bytes);
+                kmem_entry.set_limit(kmem.limit_in_bytes as u64);
+                kmem_entry.set_max(kmem.max_usage_in_bytes);
+                kmem_entry.set_failcnt(kmem.fail_cnt);
+                mem_stat.set_kernel(kmem_entry);
+
+                // set tcp memory
+                let kmem_tcp = mem_ctr.kmem_tcp_stat();
+                let mut kmem_tcp_entry = MemoryEntry::new();
+                kmem_tcp_entry.set_usage(kmem_tcp.usage_in_bytes);
+                kmem_tcp_entry.set_limit(kmem_tcp.limit_in_bytes as u64);
+                kmem_tcp_entry.set_max(kmem_tcp.max_usage_in_bytes);
+                kmem_tcp_entry.set_failcnt(kmem_tcp.fail_cnt);
+                mem_stat.set_kernel_tcp(kmem_tcp_entry);
+
+                // all other detailed stats
+                mem_stat.set_active_anon(mem.stat.active_anon);
+                mem_stat.set_active_file(mem.stat.active_file);
+                mem_stat.set_cache(mem.stat.cache);
+                mem_stat.set_dirty(mem.stat.dirty);
+                mem_stat.set_hierarchical_memory_limit(mem.stat.hierarchical_memory_limit as u64);
+                mem_stat.set_hierarchical_swap_limit(mem.stat.hierarchical_memsw_limit as u64);
+                mem_stat.set_mapped_file(mem.stat.mapped_file);
+                mem_stat.set_pg_fault(mem.stat.pgfault);
+                mem_stat.set_pg_maj_fault(mem.stat.pgmajfault);
+                mem_stat.set_pg_pg_in(mem.stat.pgpgin);
+                mem_stat.set_pg_pg_out(mem.stat.pgpgout);
+                mem_stat.set_rss(mem.stat.rss);
+                mem_stat.set_rss_huge(mem.stat.rss_huge);
+                mem_stat.set_total_active_anon(mem.stat.total_active_anon);
+                mem_stat.set_total_active_file(mem.stat.total_active_file);
+                mem_stat.set_inactive_anon(mem.stat.inactive_anon);
+                mem_stat.set_inactive_file(mem.stat.inactive_file);
+                mem_stat.set_total_cache(mem.stat.total_cache);
+                mem_stat.set_total_dirty(mem.stat.total_dirty);
+                mem_stat.set_total_inactive_anon(mem.stat.total_inactive_anon);
                 mem_stat.set_total_inactive_file(mem.stat.total_inactive_file);
+                mem_stat.set_total_mapped_file(mem.stat.total_mapped_file);
+                mem_stat.set_total_pg_fault(mem.stat.total_pgfault);
+                mem_stat.set_total_pg_maj_fault(mem.stat.total_pgmajfault);
+                mem_stat.set_total_pg_pg_in(mem.stat.total_pgpgin);
+                mem_stat.set_total_pg_pg_out(mem.stat.total_pgpgout);
+                mem_stat.set_total_rss(mem.stat.total_rss);
+                mem_stat.set_total_rss_huge(mem.stat.total_rss_huge);
+                mem_stat.set_total_unevictable(mem.stat.total_unevictable);
+                mem_stat.set_total_writeback(mem.stat.total_writeback);
+                mem_stat.set_unevictable(mem.stat.unevictable);
+                mem_stat.set_writeback(mem.stat.writeback);
                 metrics.set_memory(mem_stat);
             }
             Subsystem::Pid(pid_ctr) => {
@@ -418,5 +508,36 @@ mod tests {
             parse_cgroups_v2_path(path).unwrap(),
             PathBuf::from("/sys/fs/cgroup/kubepods-besteffort-pod8.slice:cri-containerd:8")
         );
+    }
+}
+
+#[cfg_attr(feature = "tracing", tracing::instrument(level = "info"))]
+fn set_cpu_usage_and_throttle(stat: &str, cpu_usage: &mut CPUUsage, throttle: &mut Throttle) {
+    for line in stat.lines() {
+        let parts = line.split_whitespace().collect::<Vec<&str>>();
+        if parts.len() == 2 {
+            let value = parts[1].parse::<u64>().unwrap_or_default();
+            match parts[0] {
+                "usage_usec" => {
+                    cpu_usage.set_total(value);
+                }
+                "user_usec" => {
+                    cpu_usage.set_user(value);
+                }
+                "system_usec" => {
+                    cpu_usage.set_kernel(value);
+                }
+                "nr_periods" => {
+                    throttle.set_periods(value);
+                }
+                "nr_throttled" => {
+                    throttle.set_throttled_periods(value);
+                }
+                "throttled_usec" => {
+                    throttle.set_throttled_time(value);
+                }
+                _ => {}
+            }
+        }
     }
 }
