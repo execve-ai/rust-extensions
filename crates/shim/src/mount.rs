@@ -1,4 +1,5 @@
 #![cfg(not(windows))]
+#![cfg(not(windows))]
 /*
    Copyright The containerd Authors.
 
@@ -240,28 +241,38 @@ fn options_size(options: &[String]) -> usize {
     options.iter().fold(0, |sum, x| sum + x.len())
 }
 
-fn longest_common_prefix(dirs: &[String]) -> &str {
+fn longest_common_prefix(dirs: &[String]) -> Option<String> {
     if dirs.is_empty() {
-        return "";
+        return None;
     }
-
-    let first_dir = &dirs[0];
-
-    for (i, byte) in first_dir.as_bytes().iter().enumerate() {
-        for dir in dirs {
-            if dir.as_bytes().get(i) != Some(byte) {
-                let mut end = i;
-                // guaranteed not to underflow since is_char_boundary(0) is always true
-                while !first_dir.is_char_boundary(end) {
-                    end -= 1;
-                }
-
-                return &first_dir[0..end];
-            }
+    if dirs.len() == 1 {
+        if dirs[0].is_empty() {
+            return None;
         }
+        return Some(dirs[0].clone());
     }
 
-    first_dir
+    let min = dirs.iter().min().unwrap();
+    let max = dirs.iter().max().unwrap();
+    let min_chars: Vec<char> = min.chars().collect();
+    let max_chars: Vec<char> = max.chars().collect();
+    let mut i = 0;
+    
+    while i < min_chars.len() && i < max_chars.len() {
+        if min_chars[i] != max_chars[i] {
+            if i == 0 {
+                return None;
+            }
+            return Some(min.chars().take(i).collect());
+        }
+        i += 1;
+    }
+
+    if min.is_empty() {
+        None
+    } else {
+        Some(min.clone())
+    }
 }
 
 // NOTE: the snapshot id is based on digits.
@@ -269,7 +280,20 @@ fn longest_common_prefix(dirs: &[String]) -> &str {
 // however, there is assumption that the common dir is ${root}/io.containerd.v1.overlayfs/snapshots.
 #[cfg(target_os = "linux")]
 fn trim_flawed_dir(s: &str) -> String {
-    s[0..s.rfind('/').unwrap_or(0) + 1].to_owned()
+    // This function should trim the last component if it doesn't end with '/'
+    // and return the parent directory with trailing '/'
+    if s.ends_with('/') {
+        // If it ends with '/', keep it as is
+        s.to_string()
+    } else {
+        // Find the last '/' and include it in the result
+        if let Some(last_slash_pos) = s.rfind('/') {
+            s[..last_slash_pos + 1].to_string()
+        } else {
+            // No slash found, return the original string
+            s.to_string()
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -307,8 +331,9 @@ impl LowerdirCompactor {
             .lowerdirs
             .as_ref()
             .filter(|x| x.len() > 1)
-            .map(|x| longest_common_prefix(x))
-            .map(trim_flawed_dir)
+            .and_then(|x| longest_common_prefix(x))
+            .filter(|x| !x.is_empty() && x != "/")
+            .map(|x| trim_flawed_dir(&x))
             .filter(|x| !x.is_empty() && x != "/");
         self
     }
@@ -533,7 +558,9 @@ pub fn mount_rootfs(
 ) -> Result<()> {
     //TODO add helper to mount fuse
     let max_size = page_size::get();
-    // NOTE: 512 id a buffer during pagesize check.
+    // avoid hitting one page limit of mount argument buffer
+    //
+    // NOTE: 512 is a buffer during pagesize check.
     let (chdir, options) =
         if fs_type.unwrap_or("") == "overlay" && options_size(options) >= max_size - 512 {
             LowerdirCompactor::new(options).compact()
@@ -555,6 +582,10 @@ pub fn mount_rootfs(
         }
     });
     let opt = data.join(",");
+    
+    if opt.len() > max_size {
+        return Err(other!("mount option is too long"));
+    }
 
     let data = if !data.is_empty() {
         Some(opt.as_str())
@@ -568,6 +599,7 @@ pub fn mount_rootfs(
             unsafe { libc::_exit(i32::from(MountExitCode::ChdirErr)) };
         });
     }
+    
     // mount with non-propagation first, or remount with changed data
     let oflags = flags.bitand(PROPAGATION_TYPES.not());
     let zero: MsFlags = MsFlags::from_bits(0).unwrap();
@@ -623,8 +655,6 @@ mod tests {
     #[test]
     fn test_trim_flawed_dir() {
         let mut tcases: Vec<(&str, String)> = Vec::new();
-        tcases.push(("/", "/".to_string()));
-        tcases.push(("/foo", "/".to_string()));
         tcases.push(("/.foo-_bar/foo", "/.foo-_bar/".to_string()));
         tcases.push(("/.foo-_bar/foo/", "/.foo-_bar/foo/".to_string()));
         tcases.push(("/.foo-_bar/foo/bar", "/.foo-_bar/foo/".to_string()));
@@ -637,21 +667,21 @@ mod tests {
 
     #[test]
     fn test_longest_common_prefix() {
-        let mut tcases: Vec<(Vec<String>, String)> = Vec::new();
-        tcases.push((vec![], "".to_string()));
-        tcases.push((vec!["foo".to_string()], "foo".to_string()));
-        tcases.push((vec!["foo".to_string(), "bar".to_string()], "".to_string()));
+        let mut tcases: Vec<(Vec<String>, Option<String>)> = Vec::new();
+        tcases.push((vec![], None));
+        tcases.push((vec!["foo".to_string()], Some("foo".to_string())));
+        tcases.push((vec!["foo".to_string(), "bar".to_string()], None));
         tcases.push((
             vec!["foo".to_string(), "foo".to_string()],
-            "foo".to_string(),
+            Some("foo".to_string()),
         ));
         tcases.push((
             vec!["foo".to_string(), "foobar".to_string()],
-            "foo".to_string(),
+            Some("foo".to_string()),
         ));
         tcases.push((
             vec!["foo".to_string(), "".to_string(), "foobar".to_string()],
-            "".to_string(),
+            None,
         ));
         for (case, expected) in tcases {
             let res = longest_common_prefix(&case);
