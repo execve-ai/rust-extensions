@@ -16,7 +16,10 @@
 
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    env,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -199,6 +202,13 @@ impl AsOption for str {
     }
 }
 
+/// Returns a temp dir. If the environment variable "XDG_RUNTIME_DIR" is set, return its value.
+/// Otherwise if `std::env::temp_dir()` failed, return current dir or return the temp dir depended on OS.
+pub(crate) fn xdg_runtime_dir() -> String {
+    env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| env::temp_dir().to_str().unwrap_or(".").to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +217,26 @@ mod tests {
     fn test_timestamp() {
         let ts = timestamp().unwrap();
         assert!(ts.seconds > 0);
+    }
+
+    #[test]
+    fn test_xdg_runtime_dir() {
+        // Test that xdg_runtime_dir returns a non-empty string
+        let runtime_dir = xdg_runtime_dir();
+        assert!(!runtime_dir.is_empty());
+        
+        // Test with XDG_RUNTIME_DIR set
+        env::set_var("XDG_RUNTIME_DIR", "/tmp/test-runtime");
+        let runtime_dir = xdg_runtime_dir();
+        assert_eq!(runtime_dir, "/tmp/test-runtime");
+        
+        // Clean up
+        env::remove_var("XDG_RUNTIME_DIR");
+        
+        // Test without XDG_RUNTIME_DIR set
+        let runtime_dir = xdg_runtime_dir();
+        assert!(!runtime_dir.is_empty());
+        // Should fall back to temp_dir or "."
+        assert!(runtime_dir.contains("/tmp") || runtime_dir == ".");
     }
 }
